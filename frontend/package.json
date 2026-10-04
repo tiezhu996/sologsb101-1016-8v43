@@ -8,7 +8,9 @@
     "dev": "vite --host --port 22816",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview --host --port 22816",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node scripts/test-topology.mjs && node scripts/test-db.mjs",
+    "test:migration": "esbuild scripts/test-migration.ts --bundle --format=esm --platform=node --outfile=node_modules/.cache/mig.mjs && node node_modules/.cache/mig.mjs"
   },
   "dependencies": {
     "@solidjs/router": "^0.15.1",
@@ -22,6 +24,8 @@
     "tailwindcss": "^3.4.17",
     "typescript": "~5.7.3",
     "vite": "^6.1.0",
-    "vite-plugin-solid": "^2.11.1"
+    "vite-plugin-solid": "^2.11.1",
+    "fake-indexeddb": "^6.0.0",
+    "esbuild": "^0.25.0"
   }
 }

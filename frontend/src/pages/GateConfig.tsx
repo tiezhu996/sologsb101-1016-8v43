@@ -10,10 +10,12 @@ import EmptyPanel from '../components/common/EmptyPanel';
 import FilterBar from '../components/common/FilterBar';
 import StatBadge from '../components/common/StatBadge';
 import StageTag from '../components/common/StageTag';
+import SwitchoverDialog from '../components/common/SwitchoverDialog';
 import { usePondStore } from '../stores/pondStore';
 import { GATE_STATE_OPTIONS, type Gate, type GateDraft, type GateState } from '../types/gate';
 import { estimateInflowM3, gateFlowAreaM2, stateFromOpening } from '../utils/brine';
-import { putGate, removeGate, updateGateOpening } from '../utils/db';
+import { getSwitchDraft, putGate, ROW_REVISION, removeGate, updateGateOpening } from '../utils/db';
+import { INITIAL_TOPOLOGY_ID } from '../types/topology';
 import { nowIso, uuid } from '../utils/id';
 
 const INPUT =
@@ -39,12 +41,19 @@ export default function GateConfig() {
   const [dialogOpen, setDialogOpen] = createSignal(false);
   const [editingId, setEditingId] = createSignal<string | null>(null);
   const [deletingGate, setDeletingGate] = createSignal<Gate | null>(null);
+  const [switchOpen, setSwitchOpen] = createSignal(false);
+  const [hasDraft, setHasDraft] = createSignal(false);
   const [message, setMessage] = createSignal('');
   const [draft, setDraft] = createStore<GateDraft>({ ...DEFAULT_DRAFT });
 
   onMount(() => {
     void store.loadAll();
+    void getSwitchDraft().then((saved) => setHasDraft(saved !== null));
   });
+
+  /** 生效拓扑版本（临时换线提交后新版本成为编辑对象，旧版本闸门保留） */
+  const activeVersion = () => store.activeTopologyVersion();
+  const activeGates = (): Gate[] => store.activeGates();
 
   const pondOf = (pondId: string) => store.state.ponds.find((pond) => pond.id === pondId) ?? null;
   const pondLabel = (pondId: string): string => {
@@ -62,7 +71,7 @@ export default function GateConfig() {
 
   const gatesOfSeries = (): Gate[] => {
     const series = store.state.currentSeries;
-    return store.state.gates.filter((gate) => {
+    return activeGates().filter((gate) => {
       const from = pondOf(gate.fromPondId);
       const to = pondOf(gate.toPondId);
       if (series === null) return true;
@@ -112,9 +121,10 @@ export default function GateConfig() {
       await putGate({
         id: uuid('gate'),
         ...payload,
+        topologyVersionId: activeVersion()?.id ?? INITIAL_TOPOLOGY_ID,
         createdAt: stamp,
         updatedAt: stamp,
-        revision: 2,
+        revision: ROW_REVISION,
       });
       setMessage(`已新建闸门：${pondLabel(payload.fromPondId)} → ${pondLabel(payload.toPondId)}`);
     } else {
@@ -143,19 +153,26 @@ export default function GateConfig() {
   return (
     <div class="space-y-3.5">
       <div class="flex flex-wrap gap-3">
-        <StatBadge label="闸门总数" value={store.state.gates.length} suffix="条" tone="primary" />
-        <StatBadge label="当前池系闸门" value={gatesOfSeries().length} suffix="条" tone="info" />
+        <StatBadge label="闸门串级版本" value={activeVersion() === null ? '—' : `v${activeVersion()?.id}`} suffix={activeVersion()?.name ?? ''} tone="primary" hint="每次临时换线提交生成新版本；旧版本闸门保留，供已锁定批次引用" />
+        <StatBadge label="当前版本闸门" value={activeGates().length} suffix="条" tone="info" />
         <StatBadge
           label="全开闸门"
-          value={store.state.gates.filter((gate) => gate.state === '全开').length}
+          value={activeGates().filter((gate) => gate.state === '全开').length}
           suffix="条"
           tone="success"
         />
         <StatBadge
           label="关闭闸门"
-          value={store.state.gates.filter((gate) => gate.state === '关闭').length}
+          value={activeGates().filter((gate) => gate.state === '关闭').length}
           suffix="条"
           tone="warning"
+        />
+        <StatBadge
+          label="待确认走水计划"
+          value={store.pendingScheduleCount()}
+          suffix="条"
+          tone="danger"
+          hint="换线后路线经过停用池或找不到连续下游，留在待确认区等待人工处理"
         />
         <StatBadge
           label="下游预计进水合计"
@@ -166,6 +183,15 @@ export default function GateConfig() {
         />
       </div>
 
+      <Show when={hasDraft()}>
+        <div class="rounded-lg border border-amber-300 bg-amber-50 px-3.5 py-2 text-sm text-amber-800">
+          存在未提交的临时换线草稿，重开页面仍可继续：
+          <button class="ml-2 font-medium text-amber-900 underline" onClick={() => setSwitchOpen(true)}>
+            打开换线工作区
+          </button>
+        </div>
+      </Show>
+
       <Show when={message() !== ''}>
         <div class="rounded-lg border border-brine-200 bg-brine-50 px-3.5 py-2 text-sm text-brine-800">
           {message()}
@@ -174,10 +200,29 @@ export default function GateConfig() {
 
       <section class="rounded-xl border border-slate-200 bg-white p-4">
         <header class="mb-3 flex flex-wrap items-center justify-between gap-2">
-          <h2 class="text-[15px] font-semibold text-slate-800">串级走向与闸门配置</h2>
-          <button type="button" class={BTN_PRIMARY} onClick={openCreate} disabled={store.state.ponds.length < 2}>
-            + 新建闸门
-          </button>
+          <h2 class="text-[15px] font-semibold text-slate-800">
+            串级走向与闸门配置
+            <Show when={activeVersion() !== null}>
+              <span class="ml-2 rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 text-[11px] font-normal tabular-nums text-slate-500">
+                路线 v{activeVersion()?.id}
+                <Show when={activeVersion()?.note !== ''}> · {activeVersion()?.note}</Show>
+              </span>
+            </Show>
+          </h2>
+          <div class="flex flex-wrap gap-2">
+            <button
+              type="button"
+              class="rounded-md border border-amber-400 bg-amber-50 px-3.5 py-1.5 text-sm font-medium text-amber-800 transition hover:bg-amber-100 disabled:opacity-50"
+              onClick={() => setSwitchOpen(true)}
+              disabled={store.state.ponds.length === 0}
+              title="按新拓扑预演：锁定已开始/已出卤批次，未开始计划重算终点与次序"
+            >
+              临时换线
+            </button>
+            <button type="button" class={BTN_PRIMARY} onClick={openCreate} disabled={store.state.ponds.length < 2}>
+              + 新建闸门
+            </button>
+          </div>
         </header>
 
         <FilterBar
@@ -189,10 +234,10 @@ export default function GateConfig() {
             if (key === 'series') store.setCurrentSeries(value === 'all' ? null : value);
           }}
           onReset={() => store.setCurrentSeries(store.seriesOptions()[0] ?? null)}
-          resultText={`命中 ${gatesOfSeries().length} / ${store.state.gates.length} 条`}
+          resultText={`命中 ${gatesOfSeries().length} / ${activeGates().length} 条`}
         />
 
-        <Show when={store.state.ready && store.state.gates.length === 0}>
+        <Show when={store.state.ready && activeGates().length === 0}>
           <EmptyPanel
             title="还没有闸门串级"
             description="新建闸门把上游池与下游池连接起来，配置开度后即可看到下游预计进水量的即时变化。"
@@ -201,7 +246,7 @@ export default function GateConfig() {
           />
         </Show>
 
-        <Show when={store.state.gates.length > 0}>
+        <Show when={activeGates().length > 0}>
           <div class="overflow-x-auto">
             <table class="w-full min-w-[1100px] border-collapse text-sm">
               <thead>
@@ -295,7 +340,7 @@ export default function GateConfig() {
           </div>
         </Show>
 
-        <Show when={store.state.gates.length > 0 && gatesOfSeries().length === 0}>
+        <Show when={activeGates().length > 0 && gatesOfSeries().length === 0}>
           <EmptyPanel
             title="当前池系没有闸门"
             description="可以切换池系，或为该池系新建一条串级闸门。"
@@ -304,6 +349,59 @@ export default function GateConfig() {
           />
         </Show>
       </section>
+
+      <Show when={store.state.topologyVersions.length > 0}>
+        <section class="rounded-xl border border-slate-200 bg-white p-4">
+          <header class="mb-2 flex items-center justify-between">
+            <h2 class="text-[15px] font-semibold text-slate-800">闸门串级（路线）版本</h2>
+            <span class="text-xs text-slate-400">走水计划按所依据的版本显示路线 vN；换线不会改写历史版本</span>
+          </header>
+          <ul class="flex flex-wrap gap-2">
+            <For each={[...store.state.topologyVersions].sort((a, b) => b.id - a.id)}>
+              {(version) => (
+                <li
+                  class={`rounded-lg border px-3 py-2 text-xs ${
+                    version.id === activeVersion()?.id
+                      ? 'border-brine-400 bg-brine-50 text-brine-800'
+                      : 'border-slate-200 bg-slate-50 text-slate-500'
+                  }`}
+                >
+                  <p class="font-semibold">
+                    路线 v{version.id} · {version.name}
+                    <Show when={version.id === activeVersion()?.id}>
+                      <span class="ml-1 rounded bg-brine-600 px-1 py-0.5 text-[10px] text-white">生效中</span>
+                    </Show>
+                  </p>
+                  <p class="mt-0.5 text-[11px]">
+                    提交于 {version.appliedAt.slice(0, 16).replace('T', ' ')}
+                    <Show when={version.operator !== ''}> · {version.operator}</Show>
+                  </p>
+                  <Show when={version.note !== ''}>
+                    <p class="mt-0.5 max-w-[260px] text-[11px]">{version.note}</p>
+                  </Show>
+                </li>
+              )}
+            </For>
+          </ul>
+        </section>
+      </Show>
+
+      <SwitchoverDialog
+        open={switchOpen()}
+        onClose={() => {
+          setSwitchOpen(false);
+          void getSwitchDraft().then((saved) => setHasDraft(saved !== null));
+        }}
+        ponds={store.state.ponds}
+        gates={store.state.gates}
+        schedules={store.state.schedules}
+        activeTopology={activeVersion()}
+        onCommitted={(text) => {
+          setSwitchOpen(false);
+          setHasDraft(false);
+          setMessage(text);
+        }}
+      />
 
       <AppDialog
         open={dialogOpen()}

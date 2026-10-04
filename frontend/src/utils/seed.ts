@@ -9,7 +9,10 @@ import type { Gate } from '../types/gate';
 import type { Observation } from '../types/observation';
 import type { Assay } from '../types/assay';
 import type { Schedule } from '../types/schedule';
+import type { TopologyVersion } from '../types/topology';
+import { INITIAL_TOPOLOGY_ID } from '../types/topology';
 import { autoVerdict, estimateEvapMm } from './brine';
+import { resolveRouteFields } from './topology';
 
 const SEED_TIME = '2026-09-01T00:30:00.000Z';
 
@@ -88,11 +91,12 @@ export async function seedDatabase(): Promise<void> {
   ];
 
   // ---------------- 闸门串级（上游 → 下游，形成完整走向链） ----------------
+  // 全部归属初始拓扑版本（v1）；临时换线提交后新版本闸门另存，不覆盖旧版本。
   const gates: Gate[] = [
-    wrap<Gate>({ id: 'gate-a-b', fromPondId: SEED_IDS.pondA, toPondId: SEED_IDS.pondB, openingPct: 65, widthCm: 120, state: '半开', note: '北部一系主走水通道' }),
-    wrap<Gate>({ id: 'gate-b-c', fromPondId: SEED_IDS.pondB, toPondId: SEED_IDS.pondC, openingPct: 40, widthCm: 100, state: '半开', note: '进入锂盐阶段前的控流闸' }),
-    wrap<Gate>({ id: 'gate-d-e', fromPondId: SEED_IDS.pondD, toPondId: SEED_IDS.pondE, openingPct: 80, widthCm: 140, state: '半开', note: '南部二系主走水通道' }),
-    wrap<Gate>({ id: 'gate-b-e', fromPondId: SEED_IDS.pondB, toPondId: SEED_IDS.pondE, openingPct: 0, widthCm: 90, state: '关闭', note: '跨池系调水备用闸，当前关闭' }),
+    wrap<Gate>({ id: 'gate-a-b', fromPondId: SEED_IDS.pondA, toPondId: SEED_IDS.pondB, openingPct: 65, widthCm: 120, state: '半开', note: '北部一系主走水通道', topologyVersionId: INITIAL_TOPOLOGY_ID }),
+    wrap<Gate>({ id: 'gate-b-c', fromPondId: SEED_IDS.pondB, toPondId: SEED_IDS.pondC, openingPct: 40, widthCm: 100, state: '半开', note: '进入锂盐阶段前的控流闸', topologyVersionId: INITIAL_TOPOLOGY_ID }),
+    wrap<Gate>({ id: 'gate-d-e', fromPondId: SEED_IDS.pondD, toPondId: SEED_IDS.pondE, openingPct: 80, widthCm: 140, state: '半开', note: '南部二系主走水通道', topologyVersionId: INITIAL_TOPOLOGY_ID }),
+    wrap<Gate>({ id: 'gate-b-e', fromPondId: SEED_IDS.pondB, toPondId: SEED_IDS.pondE, openingPct: 0, widthCm: 90, state: '关闭', note: '跨池系调水备用闸，当前关闭', topologyVersionId: INITIAL_TOPOLOGY_ID }),
   ];
 
   // ---------------- 卤水日观测（每池 2–4 条，密度随日期递增） ----------------
@@ -129,19 +133,40 @@ export async function seedDatabase(): Promise<void> {
   ];
 
   // ---------------- 走水编排（覆盖四种状态，orderIndex 决定先后） ----------------
-  const schedules: Schedule[] = [
-    wrap<Schedule>({ id: 'schedule-a1', pondId: SEED_IDS.pondA, planDate: '2026-10-02', targetDensity: 1.115, volumeM3: 1200, operator: '韩江', state: '已排', orderIndex: 1 }),
-    wrap<Schedule>({ id: 'schedule-d1', pondId: SEED_IDS.pondD, planDate: '2026-10-04', targetDensity: 1.098, volumeM3: 1600, operator: '王锐', state: '已排', orderIndex: 2 }),
-    wrap<Schedule>({ id: 'schedule-b1', pondId: SEED_IDS.pondB, planDate: '2026-10-06', targetDensity: 1.175, volumeM3: 900, operator: '韩江', state: '走水中', orderIndex: 3 }),
-    wrap<Schedule>({ id: 'schedule-c1', pondId: SEED_IDS.pondC, planDate: '2026-10-12', targetDensity: 1.255, volumeM3: 600, operator: '李文', state: '待排', orderIndex: 4 }),
-    wrap<Schedule>({ id: 'schedule-e1', pondId: SEED_IDS.pondE, planDate: '2026-09-28', targetDensity: 1.15, volumeM3: 700, operator: '王锐', state: '已出卤', orderIndex: 5 }),
+  // 路线字段按初始拓扑补齐：走水中 / 已出卤批次锁定原路线，
+  // 未开始计划跟随初始拓扑（南-05 为清池中，路线仍连续，不会进入待确认区）。
+  const rawSchedules: Array<
+    Pick<Schedule, 'id' | 'pondId' | 'planDate' | 'targetDensity' | 'volumeM3' | 'operator' | 'state' | 'orderIndex'>
+  > = [
+    { id: 'schedule-a1', pondId: SEED_IDS.pondA, planDate: '2026-10-02', targetDensity: 1.115, volumeM3: 1200, operator: '韩江', state: '已排', orderIndex: 1 },
+    { id: 'schedule-d1', pondId: SEED_IDS.pondD, planDate: '2026-10-04', targetDensity: 1.098, volumeM3: 1600, operator: '王锐', state: '已排', orderIndex: 2 },
+    { id: 'schedule-b1', pondId: SEED_IDS.pondB, planDate: '2026-10-06', targetDensity: 1.175, volumeM3: 900, operator: '韩江', state: '走水中', orderIndex: 3 },
+    { id: 'schedule-c1', pondId: SEED_IDS.pondC, planDate: '2026-10-12', targetDensity: 1.255, volumeM3: 600, operator: '李文', state: '待排', orderIndex: 4 },
+    { id: 'schedule-e1', pondId: SEED_IDS.pondE, planDate: '2026-09-28', targetDensity: 1.15, volumeM3: 700, operator: '王锐', state: '已出卤', orderIndex: 5 },
   ];
+  const routeSeedFields = (pondId: string, state: Schedule['state']) =>
+    resolveRouteFields(pondId, state, INITIAL_TOPOLOGY_ID, gates, ponds);
+  const schedules: Schedule[] = rawSchedules.map((row) => wrap<Schedule>({ ...row, ...routeSeedFields(row.pondId, row.state) }));
 
-  await db.transaction('rw', db.ponds, db.gates, db.observations, db.assays, db.schedules, async () => {
-    await db.ponds.bulkPut(ponds);
-    await db.gates.bulkPut(gates);
-    await db.observations.bulkPut(observations);
-    await db.assays.bulkPut(assays);
-    await db.schedules.bulkPut(schedules);
+  // 初始闸门串级（路线）版本
+  const initialTopology: TopologyVersion = wrap<TopologyVersion>({
+    id: INITIAL_TOPOLOGY_ID,
+    name: '初始串级 v1',
+    note: '演示数据初始闸门串级',
+    operator: '',
+    appliedAt: SEED_TIME,
   });
+
+  await db.transaction(
+    'rw',
+    [db.ponds, db.gates, db.observations, db.assays, db.schedules, db.topologyVersions],
+    async () => {
+      await db.ponds.bulkPut(ponds);
+      await db.gates.bulkPut(gates);
+      await db.observations.bulkPut(observations);
+      await db.assays.bulkPut(assays);
+      await db.schedules.bulkPut(schedules);
+      await db.topologyVersions.put(initialTopology);
+    },
+  );
 }

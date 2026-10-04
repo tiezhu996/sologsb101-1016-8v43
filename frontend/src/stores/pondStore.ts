@@ -10,8 +10,10 @@ import type { Gate } from '../types/gate';
 import type { Observation } from '../types/observation';
 import type { Assay } from '../types/assay';
 import type { Schedule } from '../types/schedule';
+import type { TopologyVersion } from '../types/topology';
 import { DB_SCHEMA_VERSION, ROW_REVISION, countAll, db, initDatabase, putPond, removePond } from '../utils/db';
 import { effectiveVerdict, pondVolumeM3 } from '../utils/brine';
+import { activeTopology } from '../utils/topology';
 import { nowIso, uuid } from '../utils/id';
 
 /** 单口池的派生统计，供 /ponds、/gates、/export 复用 */
@@ -45,6 +47,7 @@ interface PondState {
   observations: Observation[];
   assays: Assay[];
   schedules: Schedule[];
+  topologyVersions: TopologyVersion[];
   currentSeries: string | null;
   loading: boolean;
   ready: boolean;
@@ -78,6 +81,7 @@ function createPondStore() {
     observations: [],
     assays: [],
     schedules: [],
+    topologyVersions: [],
     currentSeries: readSeries(),
     loading: true,
     ready: false,
@@ -100,16 +104,17 @@ function createPondStore() {
       if (!subscribed) {
         subscribed = true;
         liveQuery(async () => {
-          const [ponds, gates, observations, assays, schedules] = await Promise.all([
+          const [ponds, gates, observations, assays, schedules, topologyVersions] = await Promise.all([
             db.ponds.toArray(),
             db.gates.toArray(),
             db.observations.toArray(),
             db.assays.toArray(),
             db.schedules.toArray(),
+            db.topologyVersions.toArray(),
           ]);
-          return { ponds, gates, observations, assays, schedules };
+          return { ponds, gates, observations, assays, schedules, topologyVersions };
         }).subscribe({
-          next: ({ ponds, gates, observations, assays, schedules }) => {
+          next: ({ ponds, gates, observations, assays, schedules, topologyVersions }) => {
             const sorted = [...ponds].sort(
               (a, b) => a.seriesName.localeCompare(b.seriesName, 'zh-Hans-CN') || a.code.localeCompare(b.code),
             );
@@ -119,6 +124,7 @@ function createPondStore() {
               observations: [...observations].sort((a, b) => a.date.localeCompare(b.date)),
               assays: [...assays].sort((a, b) => a.date.localeCompare(b.date)),
               schedules: [...schedules].sort((a, b) => a.orderIndex - b.orderIndex),
+              topologyVersions: [...topologyVersions].sort((a, b) => a.id - b.id),
               loading: false,
               ready: true,
               error: '',
@@ -143,6 +149,21 @@ function createPondStore() {
     const set = new Set(state.ponds.map((pond) => pond.seriesName));
     return Array.from(set).sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'));
   });
+
+  /** 当前生效闸门串级（路线）版本 */
+  const activeTopologyVersion = createMemo<TopologyVersion | null>(() => activeTopology(state.topologyVersions));
+
+  /** 生效版本下的闸门（历史版本闸门仅供锁定批次引用，不在配置台直接编辑） */
+  const activeGates = createMemo<Gate[]>(() => {
+    const active = activeTopologyVersion();
+    if (active === null) return [];
+    return state.gates.filter((gate) => gate.topologyVersionId === active.id);
+  });
+
+  /** 待确认区计划数（路线经过停用池或找不到连续下游） */
+  const pendingScheduleCount = createMemo<number>(
+    () => state.schedules.filter((row) => row.pendingReason !== null).length,
+  );
 
   const stats = createMemo<Record<string, PondStat>>(() => {
     const result: Record<string, PondStat> = {};
@@ -287,6 +308,9 @@ function createPondStore() {
     state,
     revision,
     seriesOptions,
+    activeTopologyVersion,
+    activeGates,
+    pendingScheduleCount,
     stats,
     statOf,
     pondsOfSeries,

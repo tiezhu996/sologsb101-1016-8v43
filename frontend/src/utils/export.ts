@@ -9,6 +9,7 @@ import type { Observation } from '../types/observation';
 import type { Assay } from '../types/assay';
 import type { Schedule } from '../types/schedule';
 import { effectiveVerdict, pondVolumeM3, round1 } from './brine';
+import { routeChainText, routeVersionLabel } from './topology';
 import { stampSuffix } from './id';
 
 /** 触发浏览器下载 */
@@ -137,6 +138,60 @@ export function exportProgressCsvFile(
   return filename;
 }
 
+/** 生成走水计划 CSV：每条计划标出使用的路线版本、锁定状态与路线池号链 */
+export function buildSchedulesCsv(ponds: Pond[], schedules: Schedule[]): string {
+  const header = [
+    '全局次序',
+    '池号',
+    '池系',
+    '计划日期',
+    '目标密度(g/cm³)',
+    '计划量(m³)',
+    '调度员',
+    '状态',
+    '路线版本',
+    '是否锁定原路线',
+    '路线池号链',
+    '路线终点',
+    '待确认原因',
+  ];
+  const lines: string[] = [header.map(csvCell).join(',')];
+  const sorted = [...schedules].sort(
+    (a, b) => a.orderIndex - b.orderIndex || a.planDate.localeCompare(b.planDate),
+  );
+  sorted.forEach((row) => {
+    const pond = ponds.find((item) => item.id === row.pondId);
+    const terminal = row.terminalPondId === null ? null : ponds.find((item) => item.id === row.terminalPondId);
+    lines.push(
+      [
+        row.orderIndex,
+        pond?.code ?? '（池已删除）',
+        pond?.seriesName ?? '',
+        row.planDate,
+        row.targetDensity,
+        row.volumeM3,
+        row.operator === '' ? '未填写' : row.operator,
+        row.state,
+        routeVersionLabel(row.routeVersionId),
+        row.routeLocked ? '是' : '否',
+        routeChainText(row.routePath, ponds),
+        terminal === null ? (row.pendingReason === null ? '（链路终点）' : '待确认') : terminal?.code ?? '',
+        row.pendingReason ?? '',
+      ]
+        .map(csvCell)
+        .join(','),
+    );
+  });
+  return `﻿${lines.join('\n')}`;
+}
+
+/** 导出走水计划 CSV 文件 */
+export function exportSchedulesCsvFile(ponds: Pond[], schedules: Schedule[]): string {
+  const filename = `走水计划路线版本-${stampSuffix()}.csv`;
+  download(filename, buildSchedulesCsv(ponds, schedules), 'text/csv;charset=utf-8');
+  return filename;
+}
+
 /** 复制文本到剪贴板 */
 export async function copyText(text: string): Promise<boolean> {
   try {
@@ -152,7 +207,11 @@ export async function copyText(text: string): Promise<boolean> {
 
 /** 生成晒程调度通报纯文本 */
 export function buildBriefingText(ponds: Pond[], observations: Observation[], assays: Assay[], schedules: Schedule[]): string {
-  const lines: string[] = [`【盐湖晒程调度通报】共 ${ponds.length} 口蒸发池`];
+  const pendingCount = schedules.filter((row) => row.pendingReason !== null).length;
+  const lockedCount = schedules.filter((row) => row.routeLocked).length;
+  const lines: string[] = [
+    `【盐湖晒程调度通报】共 ${ponds.length} 口蒸发池；锁定原路线批次 ${lockedCount} 条，待确认区 ${pendingCount} 条`,
+  ];
   ponds.forEach((pond) => {
     const pondObs = observations.filter((row) => row.pondId === pond.id).sort((a, b) => a.date.localeCompare(b.date));
     const latest = pondObs.length > 0 ? pondObs[pondObs.length - 1] : null;
@@ -167,5 +226,15 @@ export function buildBriefingText(ponds: Pond[], observations: Observation[], as
       }，待完成走水 ${pending} 条`,
     );
   });
+  if (pendingCount > 0) {
+    schedules
+      .filter((row) => row.pendingReason !== null)
+      .forEach((row) => {
+        const pond = ponds.find((item) => item.id === row.pondId);
+        lines.push(
+          `  · 待确认：${pond?.code ?? row.pondId} ${row.planDate}（${routeVersionLabel(row.routeVersionId)}：${row.pendingReason}）`,
+        );
+      });
+  }
   return lines.join('\n');
 }

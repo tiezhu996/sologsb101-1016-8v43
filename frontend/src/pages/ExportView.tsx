@@ -6,10 +6,19 @@ import { For, Show, createMemo, createSignal, onMount } from 'solid-js';
 import StatBadge from '../components/common/StatBadge';
 import EmptyPanel from '../components/common/EmptyPanel';
 import StageTag from '../components/common/StageTag';
+import RouteVersionTag from '../components/common/RouteVersionTag';
 import { usePondStore } from '../stores/pondStore';
 import { DB_NAME, DB_SCHEMA_VERSION, exportSnapshot, importSnapshot, resetDatabase } from '../utils/db';
-import { buildBriefingText, copyText, exportProgressCsvFile, exportSnapshotJson, parseSnapshot } from '../utils/export';
+import {
+  buildBriefingText,
+  copyText,
+  exportProgressCsvFile,
+  exportSchedulesCsvFile,
+  exportSnapshotJson,
+  parseSnapshot,
+} from '../utils/export';
 import { effectiveVerdict } from '../utils/brine';
+import { routeChainText } from '../utils/topology';
 
 const BTN_GHOST =
   'rounded-md border border-slate-300 bg-white px-3.5 py-1.5 text-sm text-slate-700 transition hover:bg-slate-100';
@@ -38,6 +47,9 @@ export default function ExportView() {
       assays: assays.length,
       gates: store.state.gates.length,
       schedules: schedules.length,
+      topologyVersions: store.state.topologyVersions.length,
+      pendingSchedules: schedules.filter((row) => row.pendingReason !== null).length,
+      lockedSchedules: schedules.filter((row) => row.routeLocked).length,
       passCount,
       passPct: assays.length === 0 ? 0 : Math.round((passCount / assays.length) * 1000) / 10,
       donePct: schedules.length === 0 ? 0 : Math.round((done / schedules.length) * 1000) / 10,
@@ -59,6 +71,11 @@ export default function ExportView() {
       store.state.schedules,
     );
     setMessage(`已导出晒程进度汇总 ${filename}`);
+  };
+
+  const handleExportSchedulesCsv = (): void => {
+    const filename = exportSchedulesCsvFile(store.state.ponds, store.state.schedules);
+    setMessage(`已导出走水计划（含路线版本）${filename}`);
   };
 
   const handleCopyBriefing = async (): Promise<void> => {
@@ -108,12 +125,14 @@ export default function ExportView() {
         />
         <StatBadge label="出卤候选池" value={summary().readyPonds} suffix="口" tone="success" />
         <StatBadge label="出卤完成率" value={`${summary().donePct}%`} percent={summary().donePct} tone="primary" />
+        <StatBadge label="锁定原路线批次" value={summary().lockedSchedules} suffix="条" tone="warning" />
+        <StatBadge label="待确认计划" value={summary().pendingSchedules} suffix="条" tone="danger" />
         <StatBadge
           label="数据结构版本"
           value={`v${DB_SCHEMA_VERSION}`}
           suffix={`· ${DB_NAME}`}
           tone="default"
-          hint="IndexedDB 库名与结构版本；v1 建表与 pondId+date 复合索引，v2 新增 evapMm 并迁移旧记录"
+          hint="IndexedDB 库名与结构版本；v1 建表与 pondId+date 复合索引，v2 新增 evapMm，v3 闸门串级版本化并为走水计划记录路线版本"
         />
       </div>
 
@@ -130,6 +149,9 @@ export default function ExportView() {
             </button>
             <button class={BTN_GHOST} onClick={handleExportCsv}>
               导出 CSV 汇总
+            </button>
+            <button class={BTN_GHOST} onClick={handleExportSchedulesCsv}>
+              导出走水计划 CSV（含路线版本）
             </button>
             <button class={BTN_GHOST} onClick={() => void handleCopyBriefing()}>
               复制调度通报
@@ -225,6 +247,62 @@ export default function ExportView() {
           </div>
         </Show>
       </section>
+
+      <Show when={store.state.schedules.length > 0}>
+        <section class="rounded-xl border border-slate-200 bg-white p-4">
+          <header class="mb-3">
+            <h2 class="text-[15px] font-semibold text-slate-800">走水计划与路线版本</h2>
+            <p class="mt-0.5 text-xs text-slate-400">
+              每条计划标注依据的闸门串级版本；走水中 / 已出卤批次已锁定原路线，待确认项标明原因。
+            </p>
+          </header>
+          <div class="overflow-x-auto">
+            <table class="w-full min-w-[980px] border-collapse text-sm">
+              <thead>
+                <tr class="border-b border-slate-200 bg-slate-50 text-left text-xs text-slate-500">
+                  <th class="px-3 py-2 text-right">次序</th>
+                  <th class="px-3 py-2">池号 / 池系</th>
+                  <th class="px-3 py-2">计划日期</th>
+                  <th class="px-3 py-2">状态</th>
+                  <th class="px-3 py-2">路线版本</th>
+                  <th class="px-3 py-2">路线池号链 / 待确认原因</th>
+                </tr>
+              </thead>
+              <tbody>
+                <For each={[...store.state.schedules].sort((a, b) => a.orderIndex - b.orderIndex || a.planDate.localeCompare(b.planDate))}>
+                  {(row) => {
+                    const pond = (): (typeof store.state.ponds)[number] | undefined =>
+                      store.state.ponds.find((item) => item.id === row.pondId);
+                    return (
+                      <tr
+                        class={`border-b border-slate-100 hover:bg-slate-50/60 ${
+                          row.pendingReason !== null ? 'bg-rose-50/40' : row.routeLocked ? 'bg-amber-50/40' : ''
+                        }`}
+                      >
+                        <td class="px-3 py-2.5 text-right tabular-nums text-slate-500">{row.orderIndex}</td>
+                        <td class="px-3 py-2.5 font-medium text-slate-800">
+                          {pond()?.code ?? '（池已删除）'}
+                          <span class="ml-1 text-xs font-normal text-slate-400">{pond()?.seriesName ?? ''}</span>
+                        </td>
+                        <td class="px-3 py-2.5 tabular-nums text-slate-600">{row.planDate}</td>
+                        <td class="px-3 py-2.5 text-xs">{row.state}</td>
+                        <td class="px-3 py-2.5">
+                          <RouteVersionTag schedule={row} />
+                        </td>
+                        <td class="px-3 py-2.5 text-xs text-slate-600">
+                          <Show when={row.pendingReason === null} fallback={<span class="text-rose-600">待确认：{row.pendingReason}</span>}>
+                            {routeChainText(row.routePath, store.state.ponds)}
+                          </Show>
+                        </td>
+                      </tr>
+                    );
+                  }}
+                </For>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </Show>
 
       <Show when={resetOpen()}>
         <div class="fixed inset-0 z-40 flex items-start justify-center bg-slate-900/40 p-8">

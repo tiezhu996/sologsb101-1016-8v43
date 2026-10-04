@@ -41,7 +41,7 @@ docker compose up -d --build       # 改完代码后重新构建
 | 路由 | @solidjs/router 0.15 | `Router root={App}` 布局路由，全部路径支持深链刷新 |
 | 状态管理 | Solid 原生能力 | `createStore`（pondStore / scheduleStore）+ `createSignal`（observationStore），**不使用 Pinia / Zustand** |
 | UI | Tailwind CSS 3.4 | 全部界面手写 Tailwind，**不使用 Element Plus / Ant Design / Vue / React** |
-| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbbrinepond`，`v1 → v2` 新增 `evapMm` 并迁移旧记录 |
+| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbbrinepond`，`v2` 新增 `evapMm`；`v3` 闸门串级版本化，走水计划携带路线版本 / 锁定路线 / 待确认原因 |
 | 容器 | node:20-alpine → nginx:alpine | 多阶段构建，`chmod -R a+rX` 规避静态资源 403 |
 
 ---
@@ -85,11 +85,11 @@ sologsb101-1016/
 | 路由 | 页面文件 | 功能 |
 | --- | --- | --- |
 | `/ponds` | `pages/PondList.tsx` | 蒸发池与池系台账：新建/编辑/级联删除、按池系与阶段筛选，卡片回显当期密度与最近观测日期 |
-| `/gates` | `pages/GateConfig.tsx` | 串级走向与闸门配置：拓扑列表 + 开度就地编辑（滑块/数字），实时重算下游预计进水量 |
+| `/gates` | `pages/GateConfig.tsx` | 串级走向与闸门配置：拓扑列表 + 开度就地编辑（滑块/数字），实时重算下游预计进水量；**临时换线**工作区提交受影响计划预演（锁定/重算/待确认） |
 | `/observations` | `pages/ObservationEntry.tsx` | 卤水日观测录入台：单条 + 批量粘贴录入，同池同日覆盖写入，蒸发量按经验公式自动估算 |
 | `/assays` | `pages/AssayEntry.tsx` | 离子组分分析：Li⁺/K⁺/Mg²⁺/Na⁺ 录入、自动达标判定（可人工覆盖）、SVG 组分曲线 |
-| `/schedules` | `pages/ScheduleBoard.tsx` | 走水与出卤编排：按日期排序、HTML5 拖拽调整先后顺序、逐条推进状态、出卤回写池阶段 |
-| `/export` | `pages/ExportView.tsx` | 晒程进度汇总、JSON 结构版本查看与导入导出、CSV 汇总、重置演示数据 |
+| `/schedules` | `pages/ScheduleBoard.tsx` | 走水与出卤编排：按日期排序、HTML5 拖拽调整先后顺序（锁定批次/待确认项固定）、逐条推进状态、出卤回写池阶段、每条计划标注路线版本 |
+| `/export` | `pages/ExportView.tsx` | 晒程进度汇总、JSON 结构版本查看与导入导出、CSV 汇总、**走水计划 CSV（含路线版本/路线链/待确认原因）**、重置演示数据 |
 
 `/` 重定向到 `/ponds`，未匹配路径统一回落到 `/ponds`。
 **全部路由支持直接深链**：把 `http://localhost:22816/schedules` 或 `http://localhost:22816/assays` 直接粘贴到地址栏刷新即可打开；
@@ -101,20 +101,26 @@ sologsb101-1016/
 
 * **持久化方案**：IndexedDB，通过 Dexie 封装（`src/utils/db.ts`）。
 * **数据库名**：`gbbrinepond`。
-* **数据结构版本**：`DB_SCHEMA_VERSION = 2`
+* **数据结构版本**：`DB_SCHEMA_VERSION = 3`
   * `db.version(1)`：建立全部表与 **`pondId+date` 复合索引**（`observations`、`assays`）；
   * `db.version(2)`：**新增 `evapMm` 字段**并写入真实升级迁移逻辑 ——
     `.upgrade()` 里对 `observations` 逐行检查，缺失或非法时按密度/温度/水位/风力用经验公式回填默认值；
     同时补齐 `revision` / `createdAt` / `updatedAt`、`assays.verdictManual`、`schedules.orderIndex`。
+  * `db.version(3)`：**闸门串级版本化** —— 新增 `topologyVersions`（路线版本表）与 `switchDrafts`（单行换线草稿表）；
+    `gates` 增加 `topologyVersionId`；`schedules` 增加 `routeVersionId` / `routePath` / `terminalPondId` /
+    `routeLocked` / `pendingReason`。升级时以现有闸门建立「初始串级 v1」，走水中/已出卤批次锁定其路线，
+    未开始计划按初始拓扑补算（走不通即带待确认原因）。
 * **表结构**：
 
   | 表 | 主键 | 主要索引 |
   | --- | --- | --- |
   | `ponds` | id | code, seriesName, stage, status, createdAt, updatedAt |
-  | `gates` | id | fromPondId, toPondId, state, openingPct |
+  | `gates` | id | fromPondId, toPondId, state, openingPct, topologyVersionId |
   | `observations` | id | pondId, date, **[pondId+date]**, densityGcm3, evapMm |
   | `assays` | id | pondId, date, **[pondId+date]**, verdict, verdictManual |
-  | `schedules` | id | pondId, planDate, state, orderIndex |
+  | `schedules` | id | pondId, planDate, state, orderIndex, routeVersionId, pendingReason, routeLocked |
+  | `topologyVersions` | id（路线版本号） | appliedAt |
+  | `switchDrafts` | id（固定单行 `active-switch-draft`） | updatedAt |
 
 * **首屏演示数据**：`initDatabase()` 在打开数据库后检测 `ponds` 表是否为空，为空则调用 `utils/seed.ts` 播种，
   幂等且只执行一次。播种链路为 **蒸发池 → 闸门串级 / 卤水日观测 → 离子组分分析 → 走水编排** 三层互相引用：
@@ -157,3 +163,27 @@ npm run preview      # 预览 dist 产物
   判定达标的池自动进入**出卤候选**；人工覆盖只改写判定标注，原始化验数值保持不变。
 * **闸门过流估算**：`1.7 × 过流面积 × √水头 × 开度`，用于开度调整后的下游进水量即时反馈；开度变化会同步推导闸门状态（关闭 / 半开 / 全开）。
 * **出卤回写**：走水状态推进到「已出卤」时，蒸发池阶段自动推进（钠盐→钾盐→锂盐），并把最新一次观测的密度回写为实际密度。
+
+---
+
+## 八、临时换线与路线版本规则（`src/utils/topology.ts` + `src/utils/db.ts`）
+
+盐田临时换线时调度员会改动闸门串级。为避免「正在走的批次还挂着旧下游、未开始计划不重排」，
+闸门配置台提供**可提交的换线操作**（`/gates` → 临时换线），规则如下：
+
+1. **工作区草稿随时保存**：候选拓扑（新增 / 删除 / 改向 / 调开度）存在 `switchDrafts` 单行表；
+   关闭弹层、刷新页面、提交失败后重开都能继续；「放弃草稿」才会删除。
+2. **新拓扑写入前按池系列出受影响计划**（纯函数 `planSwitchover`，预览与提交同源、结果一致）：
+   * **走水中 / 已出卤批次 → 锁定原路线**：保留换线前版本号与池号链快照（`routeLocked = true`），
+     次序固定、不可拖拽，之后换线不再影响其走向；旧版本闸门整组保留供回放。
+   * **待排 / 已排（未开始）→ 按新拓扑重算终点与次序**：沿非关闭闸门追踪连续下游
+     （同池系优先，再按开度 / 口宽 / 池号），按「池系链深度 → 计划日期 → 旧次序」统一重排 `orderIndex`。
+   * **经过停用池，或找不到连续下游 → 留在待确认区**：`pendingReason` 标注原因、从执行次序中摘出；
+     闸门 / 池状态修复后在 `/schedules` 点「复查路线」重新归队。
+3. **提交是单 Dexie 事务**（`commitSwitchover`）：新建 `topologyVersions` 版本 → 写入候选闸门 →
+   回填全部计划路线 / 待确认 / 次序 → 清除草稿。任一步失败整笔回滚、恢复原拓扑；
+   已锁定批次、待确认项与未提交草稿都保留，重开可继续提交。
+4. **路线版本全程可追溯**：每条走水计划在列表页、待确认区、导出页都显示「路线 vN · 已锁定 / 待确认」徽标与池号链；
+   JSON 存档含 `topologyVersions`，CSV 导出（走水计划 CSV）含路线版本、是否锁定、路线池号链、终点与待确认原因列。
+5. **状态推进即锁定**：计划从「已排」推进到「走水中」时按当时拓扑拍路线快照；
+   删除蒸发池会级联清理闸门并把受影响未开始计划重算 / 转入待确认区，锁定批次次序不动。

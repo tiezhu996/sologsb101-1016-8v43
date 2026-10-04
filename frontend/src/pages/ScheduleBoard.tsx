@@ -10,10 +10,12 @@ import EmptyPanel from '../components/common/EmptyPanel';
 import FilterBar from '../components/common/FilterBar';
 import StatBadge from '../components/common/StatBadge';
 import StageTag from '../components/common/StageTag';
+import RouteVersionTag from '../components/common/RouteVersionTag';
 import { usePondStore } from '../stores/pondStore';
 import { useScheduleStore } from '../stores/scheduleStore';
 import { SCHEDULE_STATE_OPTIONS, type Schedule, type ScheduleDraft, type ScheduleState } from '../types/schedule';
 import { effectiveVerdict } from '../utils/brine';
+import { routeChainText } from '../utils/topology';
 import { today } from '../utils/id';
 
 const INPUT =
@@ -83,6 +85,17 @@ export default function ScheduleBoard() {
       );
     });
   });
+
+  /** 待确认区：换线后经过停用池 / 找不到连续下游的计划 */
+  const pendingRows = createMemo<Schedule[]>(() => filtered().filter((row) => row.pendingReason !== null));
+  /** 可执行计划：未被锁定、也不在待确认区 */
+  const activeRows = createMemo<Schedule[]>(() => filtered().filter((row) => row.pendingReason === null));
+  /** 锁定批次（走水中 / 已出卤）单独标识，仍留在正常序列中展示但不可拖动 */
+  const lockedCount = createMemo<number>(() => ordered().filter((row) => row.routeLocked).length);
+
+  const recheck = async (): Promise<void> => {
+    await scheduleStore.recheckPending();
+  };
 
   const stats = createMemo(() => {
     const list = ordered();
@@ -160,6 +173,8 @@ export default function ScheduleBoard() {
         <StatBadge label="待排" value={stats().pending} suffix="条" tone="default" />
         <StatBadge label="走水中" value={stats().running} suffix="条" tone="warning" />
         <StatBadge label="已出卤" value={stats().done} suffix="条" tone="success" />
+        <StatBadge label="锁定原路线批次" value={lockedCount()} suffix="条" tone="warning" hint="走水中 / 已出卤批次已锁定换线前路线，临时换线不改变其走向" />
+        <StatBadge label="待确认区" value={pendingRows().length} suffix="条" tone="danger" hint="路线经过停用池或找不到连续下游，需在闸门恢复连续下游后复查" />
         <StatBadge label="计划总量" value={stats().volume} suffix="m³" tone="info" />
         <StatBadge label="出卤完成率" value={`${stats().donePct}%`} percent={stats().donePct} tone="success" />
       </div>
@@ -206,91 +221,169 @@ export default function ScheduleBoard() {
           />
         </Show>
 
-        <Show when={ordered().length > 0}>
-          <ul class="space-y-2">
-            <For each={filtered()}>
-              {(row, index) => (
-                <li
-                  draggable={true}
-                  class={`flex flex-wrap items-center gap-3 rounded-lg border bg-white px-3.5 py-3 transition ${
-                    dragOverId() === row.id ? 'border-brine-500 ring-1 ring-brine-400' : 'border-slate-200'
-                  }`}
-                  onDragStart={() => scheduleStore.setDraggingId(row.id)}
-                  onDragOver={(event) => {
-                    event.preventDefault();
-                    setDragOverId(row.id);
-                  }}
-                  onDragLeave={() => setDragOverId(null)}
-                  onDrop={(event) => {
-                    event.preventDefault();
-                    void handleDrop(row.id);
-                  }}
-                >
-                  <span class="grid h-7 w-7 shrink-0 cursor-grab place-items-center rounded-full bg-slate-100 text-xs font-semibold text-slate-500">
-                    {index() + 1}
-                  </span>
-                  <span class="cursor-grab text-slate-300" title="按住拖拽调整顺序">
-                    ⠿
-                  </span>
-                  <div class="min-w-[180px] flex-1">
-                    <p class="text-sm font-medium text-slate-800">{pondLabel(row.pondId)}</p>
-                    <p class="text-xs text-slate-500">
-                      计划日期 {row.planDate} · 调度员 {row.operator === '' ? '未填写' : row.operator}
-                    </p>
-                  </div>
-                  <div class="flex items-center gap-2">
-                    <StageTag stage={pondOf(row.pondId)?.stage ?? null} size="sm" />
-                  </div>
-                  <div class="text-xs text-slate-600">
-                    <p>
-                      目标密度 <span class="tabular-nums font-medium text-slate-800">{row.targetDensity}</span> g/cm³
-                    </p>
-                    <p>
-                      当前密度{' '}
-                      <span class="tabular-nums font-medium text-brine-700">
-                        {pondStore.statOf(row.pondId).currentDensity || '—'}
-                      </span>
-                    </p>
-                  </div>
-                  <div class="text-xs text-slate-600">
-                    <p>
-                      计划量 <span class="tabular-nums font-medium text-slate-800">{row.volumeM3}</span> m³
-                    </p>
-                    <p>
-                      组分判定{' '}
-                      <span class="font-medium text-slate-800">
-                        {(() => {
-                          const list = pondStore.state.assays
-                            .filter((item) => item.pondId === row.pondId)
-                            .sort((a, b) => a.date.localeCompare(b.date));
-                          return list.length === 0 ? '未化验' : effectiveVerdict(list[list.length - 1]);
-                        })()}
-                      </span>
-                    </p>
-                  </div>
-                  <span class={`rounded border px-2 py-0.5 text-[11px] ${STATE_STYLE[row.state]}`}>{row.state}</span>
-                  <div class="flex flex-wrap items-center gap-2">
-                    <button
-                      class="rounded-md border border-brine-300 bg-brine-50 px-2.5 py-1 text-xs text-brine-700 transition hover:bg-brine-100 disabled:opacity-50"
-                      disabled={row.state === '已出卤'}
-                      onClick={async () => {
-                        const next = await scheduleStore.advance(row.id);
-                        if (next === null) scheduleStore.setMessage('该计划已处于「已出卤」状态');
+        <Show when={ordered().length > 0 && filtered().length > 0}>
+          <div class="space-y-4">
+            {/* 可执行计划：已锁定批次固定不可拖，其余可拖拽调整次序 */}
+            <ul class="space-y-2">
+              <For each={activeRows()}>
+                {(row) => {
+                  const locked = (): boolean => row.routeLocked;
+                  return (
+                    <li
+                      draggable={scheduleStore.isMovable(row)}
+                      class={`flex flex-wrap items-center gap-3 rounded-lg border bg-white px-3.5 py-3 transition ${
+                        dragOverId() === row.id ? 'border-brine-500 ring-1 ring-brine-400' : 'border-slate-200'
+                      } ${locked() ? 'border-l-4 border-l-amber-400' : ''}`}
+                      onDragStart={() => {
+                        if (scheduleStore.isMovable(row)) scheduleStore.setDraggingId(row.id);
+                      }}
+                      onDragOver={(event) => {
+                        if (!scheduleStore.isMovable(row)) return;
+                        event.preventDefault();
+                        setDragOverId(row.id);
+                      }}
+                      onDragLeave={() => setDragOverId(null)}
+                      onDrop={(event) => {
+                        event.preventDefault();
+                        void handleDrop(row.id);
                       }}
                     >
-                      {nextStateLabel(row.state)}
-                    </button>
-                    <button class="text-xs text-brine-700 hover:underline" onClick={() => openEdit(row)}>
-                      编辑
-                    </button>
-                    <button class="text-xs text-rose-600 hover:underline" onClick={() => setDeleting(row)}>
-                      删除
-                    </button>
+                      <span
+                        class={`grid h-7 w-7 shrink-0 place-items-center rounded-full text-xs font-semibold ${
+                          scheduleStore.isMovable(row)
+                            ? 'cursor-grab bg-slate-100 text-slate-500'
+                            : 'cursor-default bg-amber-100 text-amber-700'
+                        }`}
+                        title={locked() ? '已锁定原路线，次序固定' : '全局次序'}
+                      >
+                        {row.orderIndex}
+                      </span>
+                      <span class={`text-slate-300 ${scheduleStore.isMovable(row) ? 'cursor-grab' : 'cursor-default'}`} title="按住拖拽调整顺序">
+                        ⠿
+                      </span>
+                      <div class="min-w-[180px] flex-1">
+                        <p class="text-sm font-medium text-slate-800">{pondLabel(row.pondId)}</p>
+                        <p class="text-xs text-slate-500">
+                          计划日期 {row.planDate} · 调度员 {row.operator === '' ? '未填写' : row.operator}
+                        </p>
+                        <p class="mt-0.5 text-[11px] text-slate-400">
+                          {locked() ? '锁定路线：' : '当前路线：'}
+                          {routeChainText(row.routePath, pondStore.state.ponds)}
+                        </p>
+                      </div>
+                      <div class="flex items-center gap-2">
+                        <StageTag stage={pondOf(row.pondId)?.stage ?? null} size="sm" />
+                      </div>
+                      <div class="text-xs text-slate-600">
+                        <p>
+                          目标密度 <span class="tabular-nums font-medium text-slate-800">{row.targetDensity}</span> g/cm³
+                        </p>
+                        <p>
+                          当前密度{' '}
+                          <span class="tabular-nums font-medium text-brine-700">
+                            {pondStore.statOf(row.pondId).currentDensity || '—'}
+                          </span>
+                        </p>
+                      </div>
+                      <div class="text-xs text-slate-600">
+                        <p>
+                          计划量 <span class="tabular-nums font-medium text-slate-800">{row.volumeM3}</span> m³
+                        </p>
+                        <p>
+                          组分判定{' '}
+                          <span class="font-medium text-slate-800">
+                            {(() => {
+                              const list = pondStore.state.assays
+                                .filter((item) => item.pondId === row.pondId)
+                                .sort((a, b) => a.date.localeCompare(b.date));
+                              return list.length === 0 ? '未化验' : effectiveVerdict(list[list.length - 1]);
+                            })()}
+                          </span>
+                        </p>
+                      </div>
+                      <span class={`rounded border px-2 py-0.5 text-[11px] ${STATE_STYLE[row.state]}`}>{row.state}</span>
+                      <RouteVersionTag schedule={row} />
+                      <div class="flex flex-wrap items-center gap-2">
+                        <button
+                          class="rounded-md border border-brine-300 bg-brine-50 px-2.5 py-1 text-xs text-brine-700 transition hover:bg-brine-100 disabled:opacity-50"
+                          disabled={row.state === '已出卤'}
+                          onClick={async () => {
+                            const next = await scheduleStore.advance(row.id);
+                            if (next === null) scheduleStore.setMessage('该计划已处于「已出卤」状态');
+                          }}
+                        >
+                          {nextStateLabel(row.state)}
+                        </button>
+                        <button class="text-xs text-brine-700 hover:underline" onClick={() => openEdit(row)}>
+                          编辑
+                        </button>
+                        <button class="text-xs text-rose-600 hover:underline" onClick={() => setDeleting(row)}>
+                          删除
+                        </button>
+                      </div>
+                    </li>
+                  );
+                }}
+              </For>
+            </ul>
+
+            {/* 待确认区：经过停用池或找不到连续下游，重开页面也保留 */}
+            <Show when={pendingRows().length > 0}>
+              <section class="rounded-lg border border-rose-200 bg-rose-50/40 p-3">
+                <header class="mb-2 flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <h3 class="text-sm font-semibold text-rose-800">待确认区（{pendingRows().length} 条）</h3>
+                    <p class="text-xs text-rose-600">
+                      这些未开始计划在新拓扑下经过停用池或找不到连续下游，已从执行次序中摘出；修复闸门 / 池状态后点「复查路线」即可重新归队。
+                    </p>
                   </div>
-                </li>
-              )}
-            </For>
-          </ul>
+                  <button
+                    class="rounded-md border border-rose-300 bg-white px-2.5 py-1 text-xs text-rose-700 transition hover:bg-rose-100"
+                    onClick={() => void recheck()}
+                  >
+                    复查路线
+                  </button>
+                </header>
+                <ul class="space-y-2">
+                  <For each={pendingRows()}>
+                    {(row) => (
+                      <li class="flex flex-wrap items-center gap-3 rounded-lg border border-rose-200 bg-white px-3.5 py-3">
+                        <span class="grid h-7 w-7 shrink-0 cursor-default place-items-center rounded-full bg-rose-100 text-xs font-semibold text-rose-700">
+                          !
+                        </span>
+                        <div class="min-w-[180px] flex-1">
+                          <p class="text-sm font-medium text-slate-800">{pondLabel(row.pondId)}</p>
+                          <p class="text-xs text-slate-500">
+                            计划日期 {row.planDate} · 调度员 {row.operator === '' ? '未填写' : row.operator}
+                          </p>
+                          <p class="mt-0.5 text-[11px] text-rose-600">
+                            待确认原因：{row.pendingReason}（尝试路线：{routeChainText(row.routePath, pondStore.state.ponds)}）
+                          </p>
+                        </div>
+                        <StageTag stage={pondOf(row.pondId)?.stage ?? null} size="sm" />
+                        <span class={`rounded border px-2 py-0.5 text-[11px] ${STATE_STYLE[row.state]}`}>{row.state}</span>
+                        <RouteVersionTag schedule={row} ponds={pondStore.state.ponds} />
+                        <div class="flex flex-wrap items-center gap-2">
+                          <button
+                            class="rounded-md border border-rose-300 bg-rose-50 px-2.5 py-1 text-xs text-rose-700 transition hover:bg-rose-100"
+                            onClick={() => void recheck()}
+                          >
+                            复查路线
+                          </button>
+                          <button class="text-xs text-brine-700 hover:underline" onClick={() => openEdit(row)}>
+                            编辑
+                          </button>
+                          <button class="text-xs text-rose-600 hover:underline" onClick={() => setDeleting(row)}>
+                            删除
+                          </button>
+                        </div>
+                      </li>
+                    )}
+                  </For>
+                </ul>
+              </section>
+            </Show>
+          </div>
         </Show>
 
         <Show when={ordered().length > 0 && filtered().length === 0}>
@@ -380,6 +473,8 @@ export default function ScheduleBoard() {
         </div>
         <p class="mt-3 rounded-md bg-slate-50 px-3 py-2 text-xs leading-relaxed text-slate-500">
           状态推进到「已出卤」时，会把该池推进到下一蒸发阶段，并把最新一次观测的密度回写为当前实际密度。
+          路线版本按当前闸门串级自动标注：推进到「走水中」即锁定当时路线，之后临时换线不再影响该批次；
+          路线经过停用池或找不到连续下游时会进入待确认区。
         </p>
       </AppDialog>
 

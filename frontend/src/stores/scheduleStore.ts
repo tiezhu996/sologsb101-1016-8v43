@@ -11,9 +11,11 @@ import {
   advanceScheduleState,
   db,
   initDatabase,
-  putSchedule,
+  recheckPendingSchedules,
   removeSchedule,
   reorderSchedules,
+  ROW_REVISION,
+  saveScheduleWithRoute,
 } from '../utils/db';
 import { nowIso, uuid } from '../utils/id';
 import { usePondStore } from './pondStore';
@@ -84,11 +86,17 @@ function createScheduleStore() {
       operator: draft.operator.trim(),
       state: draft.state,
       orderIndex: draft.orderIndex,
+      // 路线字段由 db 层按当前生效拓扑补齐（走水中 / 已出卤直接锁定）
+      routeVersionId: 0,
+      routePath: null,
+      terminalPondId: null,
+      pendingReason: null,
+      routeLocked: false,
       createdAt: stamp,
       updatedAt: stamp,
-      revision: 2,
+      revision: ROW_REVISION,
     };
-    await putSchedule(row);
+    await saveScheduleWithRoute(row);
     setState('lastMessage', `已新建走水计划：${row.planDate}`);
     return row;
   }
@@ -96,7 +104,7 @@ function createScheduleStore() {
   async function updateSchedule(scheduleId: string, draft: ScheduleDraft): Promise<void> {
     const existing = state.rows.find((row) => row.id === scheduleId);
     if (existing === undefined) return;
-    await putSchedule({
+    await saveScheduleWithRoute({
       ...existing,
       pondId: draft.pondId,
       planDate: draft.planDate,
@@ -134,28 +142,63 @@ function createScheduleStore() {
     return next;
   }
 
-  /** 拖拽排序：把 fromId 移动到 toId 之前 */
+  /** 行是否可拖拽 / 可作为落点：已锁定批次与待确认项固定，不参与重排 */
+  function isMovable(row: Schedule): boolean {
+    return !row.routeLocked && row.pendingReason === null;
+  }
+
+  /**
+   * 拖拽排序：把 fromId 移动到 toId 之前。
+   * 已锁定路线（走水中 / 已出卤）与待确认项的次序固定，
+   * 因此只在可移动行形成的序列里移动，固定行的位置原样保留。
+   */
   async function moveBefore(fromId: string, toId: string): Promise<void> {
     if (fromId === toId) return;
     const list = [...state.rows].sort((a, b) => a.orderIndex - b.orderIndex);
-    const fromIndex = list.findIndex((row) => row.id === fromId);
-    const toIndex = list.findIndex((row) => row.id === toId);
-    if (fromIndex < 0 || toIndex < 0) return;
-    const [moved] = list.splice(fromIndex, 1);
-    list.splice(toIndex, 0, moved);
-    await reorderSchedules(list.map((row) => row.id));
-    setState('lastMessage', `已调整走水顺序：${moved.planDate} 移动到第 ${toIndex + 1} 位`);
+    const from = list.find((row) => row.id === fromId);
+    const to = list.find((row) => row.id === toId);
+    if (from === undefined || to === undefined || !isMovable(from) || !isMovable(to)) return;
+    const without = list.filter((row) => row.id !== fromId);
+    const targetIndex = without.findIndex((row) => row.id === toId);
+    without.splice(targetIndex, 0, from);
+    await reorderSchedules(without.map((row) => row.id));
+    setState('lastMessage', `已调整走水顺序：${from.planDate} 移动到目标计划之前`);
   }
 
   async function moveToIndex(id: string, targetIndex: number): Promise<void> {
     const list = [...state.rows].sort((a, b) => a.orderIndex - b.orderIndex);
-    const fromIndex = list.findIndex((row) => row.id === id);
+    const moving = list.find((row) => row.id === id);
+    if (moving === undefined || !isMovable(moving)) return;
+    // 在可移动行组成的子序列中换位，固定行（已锁定 / 待确认）保持原位
+    const movable = list.filter(isMovable);
+    const fromIndex = movable.findIndex((row) => row.id === id);
     if (fromIndex < 0) return;
-    const [moved] = list.splice(fromIndex, 1);
-    const index = Math.max(0, Math.min(list.length, targetIndex));
-    list.splice(index, 0, moved);
-    await reorderSchedules(list.map((row) => row.id));
-    setState('lastMessage', `已把 ${moved.planDate} 调整到第 ${index + 1} 位`);
+    const [moved] = movable.splice(fromIndex, 1);
+    const index = Math.max(0, Math.min(movable.length, targetIndex));
+    movable.splice(index, 0, moved);
+    // 按总列表的槽位回填：固定槽位保留原固定行，可移动槽位依次取新序列
+    const fixed = list.filter((row) => !isMovable(row));
+    const ordered: Schedule[] = [];
+    let fixedPos = 0;
+    let movablePos = 0;
+    for (const row of list) {
+      if (isMovable(row)) {
+        ordered.push(movable[movablePos]);
+        movablePos += 1;
+      } else {
+        ordered.push(fixed[fixedPos]);
+        fixedPos += 1;
+      }
+    }
+    await reorderSchedules(ordered.map((row) => row.id));
+    setState('lastMessage', `已把 ${moved.planDate} 调整到第 ${index + 1} 个可执行位置`);
+  }
+
+  /** 复查待确认计划：停用池恢复 / 闸门补齐后按当前拓扑重新计算 */
+  async function recheckPending(): Promise<number> {
+    const cleared = await recheckPendingSchedules();
+    setState('lastMessage', cleared > 0 ? `复查完成：${cleared} 条计划已恢复连续下游` : '复查完成：仍没有可恢复的连续下游，计划继续留在待确认区');
+    return cleared;
   }
 
   return {
@@ -172,6 +215,8 @@ function createScheduleStore() {
     advance,
     moveBefore,
     moveToIndex,
+    isMovable,
+    recheckPending,
   };
 }
 

@@ -41,7 +41,7 @@ docker compose up -d --build       # 改完代码后重新构建
 | 路由 | @solidjs/router 0.15 | `Router root={App}` 布局路由，全部路径支持深链刷新 |
 | 状态管理 | Solid 原生能力 | `createStore`（pondStore / scheduleStore）+ `createSignal`（observationStore），**不使用 Pinia / Zustand** |
 | UI | Tailwind CSS 3.4 | 全部界面手写 Tailwind，**不使用 Element Plus / Ant Design / Vue / React** |
-| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbbrinepond`，`v1 → v2` 新增 `evapMm` 并迁移旧记录 |
+| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbbrinepond`，结构 v3：v2 新增 `evapMm`，v3 闸门路线版本化、走水计划挂路线（锁定 / 待确认） |
 | 容器 | node:20-alpine → nginx:alpine | 多阶段构建，`chmod -R a+rX` 规避静态资源 403 |
 
 ---
@@ -69,13 +69,14 @@ sologsb101-1016/
         ├── index.tsx           # 入口：render + 初始化数据库
         ├── App.tsx             # 外壳：品牌栏 + 侧边导航 + 内容区（Router root 布局）
         ├── styles/main.css     # @tailwind 指令 + 全局样式
-        ├── types/              # pond.ts gate.ts observation.ts assay.ts schedule.ts
+        ├── types/              # pond.ts gate.ts observation.ts assay.ts schedule.ts routeVersion.ts lineChange.ts
         ├── stores/             # pondStore.ts observationStore.ts scheduleStore.ts
         ├── components/common/  # StageTag.tsx FilterBar.tsx StatBadge.tsx EmptyPanel.tsx AppDialog.tsx
+        ├── components/lineChange/ # LineChangeDialog.tsx 临时换线向导（影响预览 / 草稿暂存 / 提交）
         ├── hooks/              # useEvaporation.ts useIdbTable.ts
         ├── pages/              # 6 个模块页面
         ├── router/index.tsx    # AppRouter + ROUTES 常量 + NAV_ITEMS
-        └── utils/              # brine.ts db.ts export.ts seed.ts id.ts
+        └── utils/              # brine.ts topology.ts db.ts export.ts seed.ts id.ts
 ```
 
 ---
@@ -85,11 +86,11 @@ sologsb101-1016/
 | 路由 | 页面文件 | 功能 |
 | --- | --- | --- |
 | `/ponds` | `pages/PondList.tsx` | 蒸发池与池系台账：新建/编辑/级联删除、按池系与阶段筛选，卡片回显当期密度与最近观测日期 |
-| `/gates` | `pages/GateConfig.tsx` | 串级走向与闸门配置：拓扑列表 + 开度就地编辑（滑块/数字），实时重算下游预计进水量 |
+| `/gates` | `pages/GateConfig.tsx` | 串级走向与闸门配置：拓扑列表 + 开度就地编辑（滑块/数字），实时重算下游预计进水量；支持按路线版本查看归档串级（只读），以及临时换线向导 |
 | `/observations` | `pages/ObservationEntry.tsx` | 卤水日观测录入台：单条 + 批量粘贴录入，同池同日覆盖写入，蒸发量按经验公式自动估算 |
 | `/assays` | `pages/AssayEntry.tsx` | 离子组分分析：Li⁺/K⁺/Mg²⁺/Na⁺ 录入、自动达标判定（可人工覆盖）、SVG 组分曲线 |
-| `/schedules` | `pages/ScheduleBoard.tsx` | 走水与出卤编排：按日期排序、HTML5 拖拽调整先后顺序、逐条推进状态、出卤回写池阶段 |
-| `/export` | `pages/ExportView.tsx` | 晒程进度汇总、JSON 结构版本查看与导入导出、CSV 汇总、重置演示数据 |
+| `/schedules` | `pages/ScheduleBoard.tsx` | 走水与出卤编排：按日期排序、HTML5 拖拽调整先后顺序、逐条推进状态、出卤回写池阶段；标注每条计划的路线版本 / 锁定 / 待确认状态，待确认区支持人工确认 |
+| `/export` | `pages/ExportView.tsx` | 晒程进度汇总、JSON 结构版本查看与导入导出、CSV 汇总（含走水计划路线版本明细）、重置演示数据 |
 
 `/` 重定向到 `/ponds`，未匹配路径统一回落到 `/ponds`。
 **全部路由支持直接深链**：把 `http://localhost:22816/schedules` 或 `http://localhost:22816/assays` 直接粘贴到地址栏刷新即可打开；
@@ -101,20 +102,29 @@ sologsb101-1016/
 
 * **持久化方案**：IndexedDB，通过 Dexie 封装（`src/utils/db.ts`）。
 * **数据库名**：`gbbrinepond`。
-* **数据结构版本**：`DB_SCHEMA_VERSION = 2`
+* **数据结构版本**：`DB_SCHEMA_VERSION = 3`
   * `db.version(1)`：建立全部表与 **`pondId+date` 复合索引**（`observations`、`assays`）；
   * `db.version(2)`：**新增 `evapMm` 字段**并写入真实升级迁移逻辑 ——
     `.upgrade()` 里对 `observations` 逐行检查，缺失或非法时按密度/温度/水位/风力用经验公式回填默认值；
     同时补齐 `revision` / `createdAt` / `updatedAt`、`assays.verdictManual`、`schedules.orderIndex`。
+  * `db.version(3)`：**闸门路线版本化 + 走水计划挂路线 + 临时换线**。
+    新增 `routeVersions`、`lineChangeDrafts` 两张表；`gates` 增加 `routeVersionId`，旧闸门整组归入初始版本 V1；
+    `schedules` 增加路线版本、途经池链、终点、锁定 / 待确认 / 人工确认字段，升级时按 V1 拓扑逐条推演回填。
+* **临时换线语义**：调度员在 `/gates` 发起换线后，草稿按池系持久化（提交失败或关闭重开可继续），提交前按池系实时预览受影响计划 ——
+  已开始走水 / 已出卤批次**锁定原路线版本与次序**；未开始（待排 / 已排）计划**按新拓扑重算终点并按串级深度重排次序**；
+  经过停用池或找不到连续下游（含成环）的计划**留在待确认区**，由调度员人工确认。提交是单事务：
+  旧版本归档、闸门整组保留，失败自动回滚原拓扑，锁定批次与待确认项、草稿均原样保留。
 * **表结构**：
 
   | 表 | 主键 | 主要索引 |
   | --- | --- | --- |
   | `ponds` | id | code, seriesName, stage, status, createdAt, updatedAt |
-  | `gates` | id | fromPondId, toPondId, state, openingPct |
+  | `gates` | id | routeVersionId, fromPondId, toPondId, state, openingPct |
   | `observations` | id | pondId, date, **[pondId+date]**, densityGcm3, evapMm |
   | `assays` | id | pondId, date, **[pondId+date]**, verdict, verdictManual |
-  | `schedules` | id | pondId, planDate, state, orderIndex |
+  | `schedules` | id | pondId, planDate, state, orderIndex, routeVersionId, routeLocked, routePending |
+  | `routeVersions` | id | code, isActive, createdAt, committedAt |
+  | `lineChangeDrafts` | id | seriesName, baseVersionId, updatedAt |
 
 * **首屏演示数据**：`initDatabase()` 在打开数据库后检测 `ponds` 表是否为空，为空则调用 `utils/seed.ts` 播种，
   幂等且只执行一次。播种链路为 **蒸发池 → 闸门串级 / 卤水日观测 → 离子组分分析 → 走水编排** 三层互相引用：

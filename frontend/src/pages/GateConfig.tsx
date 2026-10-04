@@ -3,17 +3,18 @@
  * 按池系渲染串级拓扑，开度就地编辑；开度调整后重算下游预计进水量。
  * 消费模型：Gate、Pond、Observation；复用组件：<FilterBar>、<StageTag>、<EmptyPanel>、<StatBadge>
  */
-import { For, Show, createSignal, onMount } from 'solid-js';
+import { For, Show, createMemo, createSignal, onMount } from 'solid-js';
 import { createStore } from 'solid-js/store';
 import AppDialog from '../components/common/AppDialog';
 import EmptyPanel from '../components/common/EmptyPanel';
 import FilterBar from '../components/common/FilterBar';
 import StatBadge from '../components/common/StatBadge';
 import StageTag from '../components/common/StageTag';
+import LineChangeDialog from '../components/lineChange/LineChangeDialog';
 import { usePondStore } from '../stores/pondStore';
 import { GATE_STATE_OPTIONS, type Gate, type GateDraft, type GateState } from '../types/gate';
 import { estimateInflowM3, gateFlowAreaM2, stateFromOpening } from '../utils/brine';
-import { putGate, removeGate, updateGateOpening } from '../utils/db';
+import { putGate, removeGate, resyncUnlockedSchedules, updateGateOpening } from '../utils/db';
 import { nowIso, uuid } from '../utils/id';
 
 const INPUT =
@@ -42,8 +43,19 @@ export default function GateConfig() {
   const [message, setMessage] = createSignal('');
   const [draft, setDraft] = createStore<GateDraft>({ ...DEFAULT_DRAFT });
 
+  // 路线版本视图：默认在用版本；查看历史版本时整页只读（锁定批次仍按旧版本追溯走向）
+  const [viewVersionId, setViewVersionId] = createSignal<string>('');
+  const [lineChangeOpen, setLineChangeOpen] = createSignal(false);
+
   onMount(() => {
     void store.loadAll();
+  });
+
+  const activeVersion = createMemo(() => store.activeRouteVersion());
+  const selectedVersionId = createMemo(() => viewVersionId() || activeVersion()?.id || '');
+  const isHistoricalView = createMemo(() => {
+    const active = activeVersion();
+    return active !== null && selectedVersionId() !== '' && selectedVersionId() !== active.id;
   });
 
   const pondOf = (pondId: string) => store.state.ponds.find((pond) => pond.id === pondId) ?? null;
@@ -62,7 +74,9 @@ export default function GateConfig() {
 
   const gatesOfSeries = (): Gate[] => {
     const series = store.state.currentSeries;
+    const versionId = selectedVersionId();
     return store.state.gates.filter((gate) => {
+      if (versionId !== '' && gate.routeVersionId !== versionId) return false;
       const from = pondOf(gate.fromPondId);
       const to = pondOf(gate.toPondId);
       if (series === null) return true;
@@ -112,6 +126,7 @@ export default function GateConfig() {
       await putGate({
         id: uuid('gate'),
         ...payload,
+        routeVersionId: activeVersion()?.id ?? '',
         createdAt: stamp,
         updatedAt: stamp,
         revision: 2,
@@ -124,6 +139,8 @@ export default function GateConfig() {
       setMessage('闸门配置已更新');
     }
     setDialogOpen(false);
+    // 日常闸门编辑只重挂未锁定计划；走水中 / 已出卤批次锁旧版本不受影响
+    await resyncUnlockedSchedules();
   };
 
   const confirmDelete = async (): Promise<void> => {
@@ -132,28 +149,30 @@ export default function GateConfig() {
     await removeGate(gate.id);
     setDeletingGate(null);
     setMessage('闸门已删除');
+    await resyncUnlockedSchedules();
   };
 
   const adjustOpening = async (gate: Gate, openingPct: number): Promise<void> => {
     const clamped = Math.max(0, Math.min(100, Math.round(openingPct)));
     await updateGateOpening(gate.id, clamped, stateFromOpening(clamped));
     setMessage(`已把 ${pondLabel(gate.fromPondId)} → ${pondLabel(gate.toPondId)} 的开度调整为 ${clamped}%`);
+    await resyncUnlockedSchedules();
   };
 
   return (
     <div class="space-y-3.5">
       <div class="flex flex-wrap gap-3">
-        <StatBadge label="闸门总数" value={store.state.gates.length} suffix="条" tone="primary" />
+        <StatBadge label={`闸门总数（${store.routeVersionCode(selectedVersionId())}）`} value={store.state.gates.filter((gate) => gate.routeVersionId === selectedVersionId()).length} suffix="条" tone="primary" />
         <StatBadge label="当前池系闸门" value={gatesOfSeries().length} suffix="条" tone="info" />
         <StatBadge
           label="全开闸门"
-          value={store.state.gates.filter((gate) => gate.state === '全开').length}
+          value={gatesOfSeries().filter((gate) => gate.state === '全开').length}
           suffix="条"
           tone="success"
         />
         <StatBadge
           label="关闭闸门"
-          value={store.state.gates.filter((gate) => gate.state === '关闭').length}
+          value={gatesOfSeries().filter((gate) => gate.state === '关闭').length}
           suffix="条"
           tone="warning"
         />
@@ -174,11 +193,60 @@ export default function GateConfig() {
 
       <section class="rounded-xl border border-slate-200 bg-white p-4">
         <header class="mb-3 flex flex-wrap items-center justify-between gap-2">
-          <h2 class="text-[15px] font-semibold text-slate-800">串级走向与闸门配置</h2>
-          <button type="button" class={BTN_PRIMARY} onClick={openCreate} disabled={store.state.ponds.length < 2}>
-            + 新建闸门
-          </button>
+          <div class="flex items-center gap-2">
+            <h2 class="text-[15px] font-semibold text-slate-800">串级走向与闸门配置</h2>
+            <select
+              class="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-600 outline-none focus:border-brine-500"
+              title="查看不同路线版本的闸门串级"
+              value={selectedVersionId()}
+              onChange={(event) => setViewVersionId(event.currentTarget.value)}
+            >
+              <For each={store.state.routeVersions}>
+                {(version) => (
+                  <option value={version.id}>
+                    {version.code}
+                    {version.isActive ? '（在用）' : '（历史归档）'}
+                  </option>
+                )}
+              </For>
+            </select>
+            <Show when={store.lineChangeDraftOf(store.state.currentSeries ?? '') !== undefined}>
+              <span class="rounded border border-amber-300 bg-amber-50 px-1.5 py-0.5 text-[11px] text-amber-700">
+                本池系有未提交换线草稿
+              </span>
+            </Show>
+          </div>
+          <div class="flex items-center gap-2">
+            <button
+              type="button"
+              class={
+                isHistoricalView()
+                  ? BTN_GHOST
+                  : 'rounded-md border border-brine-300 bg-brine-50 px-3.5 py-1.5 text-sm font-medium text-brine-700 transition hover:bg-brine-100'
+              }
+              onClick={() => setLineChangeOpen(true)}
+              disabled={store.state.ponds.length < 2 || isHistoricalView()}
+              title={isHistoricalView() ? '历史版本只读：请先切回在用版本再发起换线' : '在新拓扑写入前预览受影响计划'}
+            >
+              ⇄ 临时换线
+            </button>
+            <button
+              type="button"
+              class={BTN_PRIMARY}
+              onClick={openCreate}
+              disabled={store.state.ponds.length < 2 || isHistoricalView()}
+            >
+              + 新建闸门
+            </button>
+          </div>
         </header>
+
+        <Show when={isHistoricalView()}>
+          <div class="mb-3 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-[13px] text-slate-600">
+            当前查看历史路线版本 {store.routeVersionCode(selectedVersionId())} 的归档串级，仅供锁定批次追溯，闸门与开度只读。
+            需改线请切回在用版本后使用「临时换线」。
+          </div>
+        </Show>
 
         <FilterBar
           keyword=""
@@ -242,7 +310,8 @@ export default function GateConfig() {
                             max="100"
                             step="5"
                             value={gate.openingPct}
-                            class="h-1.5 flex-1 accent-brine-600"
+                            disabled={isHistoricalView()}
+                            class="h-1.5 flex-1 accent-brine-600 disabled:opacity-50"
                             onChange={(event) => void adjustOpening(gate, Number(event.currentTarget.value))}
                           />
                           <input
@@ -250,7 +319,8 @@ export default function GateConfig() {
                             min="0"
                             max="100"
                             value={gate.openingPct}
-                            class="w-16 rounded border border-slate-300 px-1.5 py-1 text-xs tabular-nums outline-none focus:border-brine-500"
+                            disabled={isHistoricalView()}
+                            class="w-16 rounded border border-slate-300 px-1.5 py-1 text-xs tabular-nums outline-none focus:border-brine-500 disabled:opacity-50"
                             onChange={(event) => void adjustOpening(gate, Number(event.currentTarget.value))}
                           />
                           <span class="text-xs text-slate-400">%</span>
@@ -279,12 +349,23 @@ export default function GateConfig() {
                       <td class="px-3 py-2.5 text-xs text-slate-500">{gate.note === '' ? '—' : gate.note}</td>
                       <td class="px-3 py-2.5">
                         <div class="flex gap-2">
-                          <button class="text-xs text-brine-700 hover:underline" onClick={() => openEdit(gate)}>
+                          <button
+                            class="text-xs text-brine-700 hover:underline disabled:opacity-40"
+                            disabled={isHistoricalView()}
+                            onClick={() => openEdit(gate)}
+                          >
                             编辑
                           </button>
-                          <button class="text-xs text-rose-600 hover:underline" onClick={() => setDeletingGate(gate)}>
+                          <button
+                            class="text-xs text-rose-600 hover:underline disabled:opacity-40"
+                            disabled={isHistoricalView()}
+                            onClick={() => setDeletingGate(gate)}
+                          >
                             删除
                           </button>
+                          <Show when={isHistoricalView()}>
+                            <span class="text-[11px] text-slate-400">归档只读</span>
+                          </Show>
                         </div>
                       </td>
                     </tr>
@@ -414,6 +495,17 @@ export default function GateConfig() {
           删除后下游池将失去该进水通道。
         </p>
       </AppDialog>
+
+      <LineChangeDialog
+        open={lineChangeOpen()}
+        initialSeries={store.state.currentSeries ?? store.seriesOptions()[0] ?? ''}
+        onClose={() => setLineChangeOpen(false)}
+        onCommitted={(text) => {
+          // 新版本已成为在用版本：视图切回在用并提示提交结果
+          setViewVersionId(activeVersion()?.id ?? '');
+          setMessage(text);
+        }}
+      />
     </div>
   );
 }

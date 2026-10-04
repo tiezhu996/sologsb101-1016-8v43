@@ -3,7 +3,7 @@
  * 按日期排序、拖拽调整走水先后顺序、逐条推进状态；出卤完成回写池阶段与实际密度。
  * 消费模型：Schedule、Gate、Assay；复用组件：<FilterBar>、<EmptyPanel>、<StatBadge>
  */
-import { For, Show, createMemo, createSignal, onMount } from 'solid-js';
+import { For, Show, createMemo, createSignal, onMount, type JSX } from 'solid-js';
 import { createStore } from 'solid-js/store';
 import AppDialog from '../components/common/AppDialog';
 import EmptyPanel from '../components/common/EmptyPanel';
@@ -14,6 +14,7 @@ import { usePondStore } from '../stores/pondStore';
 import { useScheduleStore } from '../stores/scheduleStore';
 import { SCHEDULE_STATE_OPTIONS, type Schedule, type ScheduleDraft, type ScheduleState } from '../types/schedule';
 import { effectiveVerdict } from '../utils/brine';
+import { routePathText } from '../utils/topology';
 import { today } from '../utils/id';
 
 const INPUT =
@@ -30,6 +31,21 @@ const STATE_STYLE: Record<ScheduleState, string> = {
   走水中: 'border-amber-300 bg-amber-50 text-amber-700',
   已出卤: 'border-emerald-300 bg-emerald-50 text-emerald-700',
 };
+
+/** 路线状态小徽标：锁定原路线 / 待确认 / 已确认，附路线版本号 */
+function RouteBadge(props: { versionCode: string; locked: boolean; pending: boolean }): JSX.Element {
+  const cls = props.locked
+    ? 'border-slate-400 bg-slate-100 text-slate-600'
+    : props.pending
+      ? 'border-amber-400 bg-amber-100 text-amber-800'
+      : 'border-brine-300 bg-brine-50 text-brine-700';
+  const label = props.locked ? `🔒 路线 ${props.versionCode}` : props.pending ? `⚠ 待确认 · ${props.versionCode}` : `路线 ${props.versionCode}`;
+  return (
+    <span class={`rounded border px-1.5 py-0.5 text-[11px] ${cls}`} title="该计划使用的串级路线版本">
+      {label}
+    </span>
+  );
+}
 
 function emptyDraft(pondId: string, orderIndex: number): ScheduleDraft {
   return {
@@ -91,10 +107,17 @@ export default function ScheduleBoard() {
       pending: list.filter((row) => row.state === '待排').length,
       running: list.filter((row) => row.state === '走水中').length,
       done: list.filter((row) => row.state === '已出卤').length,
+      locked: list.filter((row) => row.routeLocked).length,
+      routePending: list.filter((row) => row.routePending).length,
       volume: Math.round(list.reduce((acc, row) => acc + row.volumeM3, 0) * 10) / 10,
       donePct: list.length === 0 ? 0 : Math.round((list.filter((row) => row.state === '已出卤').length / list.length) * 1000) / 10,
     };
   });
+
+  /** 待确认区：换线后经过停用池 / 找不到连续下游、尚未人工确认的计划 */
+  const pendingRoutes = createMemo<Schedule[]>(() =>
+    ordered().filter((row) => row.routePending),
+  );
 
   const openCreate = (): void => {
     const pondId = pondStore.pondsOfSeries(pondStore.state.currentSeries)[0]?.id ?? pondStore.state.ponds[0]?.id ?? '';
@@ -160,6 +183,8 @@ export default function ScheduleBoard() {
         <StatBadge label="待排" value={stats().pending} suffix="条" tone="default" />
         <StatBadge label="走水中" value={stats().running} suffix="条" tone="warning" />
         <StatBadge label="已出卤" value={stats().done} suffix="条" tone="success" />
+        <StatBadge label="锁定原路线" value={stats().locked} suffix="条" tone="info" hint="已开始走水或已出卤的批次，换线后仍挂原路线版本" />
+        <StatBadge label="待确认路线" value={stats().routePending} suffix="条" tone="danger" hint="换线后经过停用池或找不到连续下游，需调度员人工确认" />
         <StatBadge label="计划总量" value={stats().volume} suffix="m³" tone="info" />
         <StatBadge label="出卤完成率" value={`${stats().donePct}%`} percent={stats().donePct} tone="success" />
       </div>
@@ -206,16 +231,58 @@ export default function ScheduleBoard() {
           />
         </Show>
 
+        <Show when={pendingRoutes().length > 0}>
+          <section class="mb-3 rounded-lg border border-amber-300 bg-amber-50/70 p-3">
+            <div class="mb-2 flex flex-wrap items-center justify-between gap-2">
+              <h3 class="text-sm font-semibold text-amber-800">
+                ⚠ 待确认区（{pendingRoutes().length} 条）：新拓扑下经停用池或找不到连续下游，不参与走水排序
+              </h3>
+            </div>
+            <ul class="space-y-2">
+              <For each={pendingRoutes()}>
+                {(row) => (
+                  <li class="flex flex-wrap items-center gap-3 rounded-lg border border-amber-200 bg-white px-3.5 py-2.5">
+                    <span class="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-amber-100 text-xs font-semibold text-amber-700">
+                      !
+                    </span>
+                    <div class="min-w-[180px] flex-1">
+                      <p class="text-sm font-medium text-slate-800">{pondLabel(row.pondId)}</p>
+                      <p class="text-xs text-slate-500">计划日期 {row.planDate} · 调度员 {row.operator === '' ? '未填写' : row.operator}</p>
+                    </div>
+                    <RouteBadge versionCode={pondStore.routeVersionCode(row.routeVersionId)} locked={row.routeLocked} pending={true} />
+                    <div class="min-w-[220px] text-xs text-slate-600">
+                      <p>
+                        推得路线：<span class="font-medium text-amber-800">{routePathText(row.routePath, pondStore.state.ponds)}</span>
+                      </p>
+                      <p class="text-amber-700">原因：{row.routeIssue === '' ? '路线不可走' : row.routeIssue}</p>
+                    </div>
+                    <button
+                      class="rounded-md border border-amber-400 bg-white px-2.5 py-1 text-xs font-medium text-amber-800 transition hover:bg-amber-100"
+                      onClick={() => void scheduleStore.confirmRoute(row.id)}
+                      title="确认后移出待确认区并加入走水排序，原因与路线版本仍保留"
+                    >
+                      人工确认路线
+                    </button>
+                  </li>
+                )}
+              </For>
+            </ul>
+          </section>
+        </Show>
+
         <Show when={ordered().length > 0}>
           <ul class="space-y-2">
-            <For each={filtered()}>
+            <For each={filtered().filter((row) => !row.routePending)}>
               {(row, index) => (
                 <li
-                  draggable={true}
+                  draggable={!row.routeLocked}
                   class={`flex flex-wrap items-center gap-3 rounded-lg border bg-white px-3.5 py-3 transition ${
                     dragOverId() === row.id ? 'border-brine-500 ring-1 ring-brine-400' : 'border-slate-200'
-                  }`}
-                  onDragStart={() => scheduleStore.setDraggingId(row.id)}
+                  } ${row.routeLocked ? 'border-l-4 border-l-slate-400' : ''}`}
+                  title={row.routeLocked ? '已开始走水：路线与次序已锁定，不能拖拽' : undefined}
+                  onDragStart={() => {
+                    if (!row.routeLocked) scheduleStore.setDraggingId(row.id);
+                  }}
                   onDragOver={(event) => {
                     event.preventDefault();
                     setDragOverId(row.id);
@@ -226,10 +293,10 @@ export default function ScheduleBoard() {
                     void handleDrop(row.id);
                   }}
                 >
-                  <span class="grid h-7 w-7 shrink-0 cursor-grab place-items-center rounded-full bg-slate-100 text-xs font-semibold text-slate-500">
+                  <span class="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-slate-100 text-xs font-semibold text-slate-500">
                     {index() + 1}
                   </span>
-                  <span class="cursor-grab text-slate-300" title="按住拖拽调整顺序">
+                  <span class={`text-slate-300 ${row.routeLocked ? 'cursor-not-allowed opacity-40' : 'cursor-grab'}`} title={row.routeLocked ? '已锁定，不可拖拽' : '按住拖拽调整顺序'}>
                     ⠿
                   </span>
                   <div class="min-w-[180px] flex-1">
@@ -269,6 +336,14 @@ export default function ScheduleBoard() {
                     </p>
                   </div>
                   <span class={`rounded border px-2 py-0.5 text-[11px] ${STATE_STYLE[row.state]}`}>{row.state}</span>
+                  <RouteBadge
+                    versionCode={pondStore.routeVersionCode(row.routeVersionId)}
+                    locked={row.routeLocked}
+                    pending={false}
+                  />
+                  <span class="max-w-[260px] truncate text-[11px] text-slate-400" title={`途经：${routePathText(row.routePath, pondStore.state.ponds)}`}>
+                    {row.routeConfirmed && row.routeIssue !== '' ? `已确认：${routePathText(row.routePath, pondStore.state.ponds)}` : routePathText(row.routePath, pondStore.state.ponds)}
+                  </span>
                   <div class="flex flex-wrap items-center gap-2">
                     <button
                       class="rounded-md border border-brine-300 bg-brine-50 px-2.5 py-1 text-xs text-brine-700 transition hover:bg-brine-100 disabled:opacity-50"

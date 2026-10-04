@@ -10,6 +10,8 @@ export const GATE_STATE_OPTIONS: GateState[] = ['关闭', '半开', '全开']
 
 export interface Gate {
   id: string
+  /** 所属路线版本（换线后旧版本闸门整组保留，锁定批次仍按旧版本追溯） */
+  routeVersionId: string
   /** 上游池 */
   fromPondId: string
   /** 下游池 */

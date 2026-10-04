@@ -8,7 +8,7 @@ import EmptyPanel from '../components/common/EmptyPanel';
 import StageTag from '../components/common/StageTag';
 import { usePondStore } from '../stores/pondStore';
 import { DB_NAME, DB_SCHEMA_VERSION, exportSnapshot, importSnapshot, resetDatabase } from '../utils/db';
-import { buildBriefingText, copyText, exportProgressCsvFile, exportSnapshotJson, parseSnapshot } from '../utils/export';
+import { buildBriefingText, copyText, exportProgressCsvFile, exportScheduleCsvFile, exportSnapshotJson, parseSnapshot } from '../utils/export';
 import { effectiveVerdict } from '../utils/brine';
 
 const BTN_GHOST =
@@ -61,12 +61,22 @@ export default function ExportView() {
     setMessage(`已导出晒程进度汇总 ${filename}`);
   };
 
+  const handleExportScheduleCsv = (): void => {
+    const filename = exportScheduleCsvFile(
+      store.state.schedules,
+      store.state.ponds,
+      store.state.routeVersions,
+    );
+    setMessage(`已导出走水计划（每条计划标注路线版本 / 途经路线 / 锁定与待确认状态）${filename}`);
+  };
+
   const handleCopyBriefing = async (): Promise<void> => {
     const text = buildBriefingText(
       store.state.ponds,
       store.state.observations,
       store.state.assays,
       store.state.schedules,
+      store.state.routeVersions,
     );
     const ok = await copyText(text);
     setMessage(ok ? '晒程调度通报已复制到剪贴板' : '当前浏览器不支持剪贴板写入，请手动复制');
@@ -113,7 +123,7 @@ export default function ExportView() {
           value={`v${DB_SCHEMA_VERSION}`}
           suffix={`· ${DB_NAME}`}
           tone="default"
-          hint="IndexedDB 库名与结构版本；v1 建表与 pondId+date 复合索引，v2 新增 evapMm 并迁移旧记录"
+          hint="IndexedDB 库名与结构版本；v1 建表与 pondId+date 复合索引，v2 新增 evapMm，v3 闸门路线版本化、走水计划挂路线（锁定 / 待确认）"
         />
       </div>
 
@@ -130,6 +140,9 @@ export default function ExportView() {
             </button>
             <button class={BTN_GHOST} onClick={handleExportCsv}>
               导出 CSV 汇总
+            </button>
+            <button class={BTN_GHOST} onClick={handleExportScheduleCsv}>
+              导出走水计划 CSV（含路线版本）
             </button>
             <button class={BTN_GHOST} onClick={() => void handleCopyBriefing()}>
               复制调度通报

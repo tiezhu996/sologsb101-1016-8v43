@@ -10,6 +10,8 @@ import type { Gate } from '../types/gate';
 import type { Observation } from '../types/observation';
 import type { Assay } from '../types/assay';
 import type { Schedule } from '../types/schedule';
+import type { RouteVersion } from '../types/routeVersion';
+import type { LineChangeDraft } from '../types/lineChange';
 import { DB_SCHEMA_VERSION, ROW_REVISION, countAll, db, initDatabase, putPond, removePond } from '../utils/db';
 import { effectiveVerdict, pondVolumeM3 } from '../utils/brine';
 import { nowIso, uuid } from '../utils/id';
@@ -45,6 +47,8 @@ interface PondState {
   observations: Observation[];
   assays: Assay[];
   schedules: Schedule[];
+  routeVersions: RouteVersion[];
+  lineChangeDrafts: LineChangeDraft[];
   currentSeries: string | null;
   loading: boolean;
   ready: boolean;
@@ -78,6 +82,8 @@ function createPondStore() {
     observations: [],
     assays: [],
     schedules: [],
+    routeVersions: [],
+    lineChangeDrafts: [],
     currentSeries: readSeries(),
     loading: true,
     ready: false,
@@ -100,16 +106,18 @@ function createPondStore() {
       if (!subscribed) {
         subscribed = true;
         liveQuery(async () => {
-          const [ponds, gates, observations, assays, schedules] = await Promise.all([
+          const [ponds, gates, observations, assays, schedules, routeVersions, lineChangeDrafts] = await Promise.all([
             db.ponds.toArray(),
             db.gates.toArray(),
             db.observations.toArray(),
             db.assays.toArray(),
             db.schedules.toArray(),
+            db.routeVersions.toArray(),
+            db.lineChangeDrafts.toArray(),
           ]);
-          return { ponds, gates, observations, assays, schedules };
+          return { ponds, gates, observations, assays, schedules, routeVersions, lineChangeDrafts };
         }).subscribe({
-          next: ({ ponds, gates, observations, assays, schedules }) => {
+          next: ({ ponds, gates, observations, assays, schedules, routeVersions, lineChangeDrafts }) => {
             const sorted = [...ponds].sort(
               (a, b) => a.seriesName.localeCompare(b.seriesName, 'zh-Hans-CN') || a.code.localeCompare(b.code),
             );
@@ -119,6 +127,8 @@ function createPondStore() {
               observations: [...observations].sort((a, b) => a.date.localeCompare(b.date)),
               assays: [...assays].sort((a, b) => a.date.localeCompare(b.date)),
               schedules: [...schedules].sort((a, b) => a.orderIndex - b.orderIndex),
+              routeVersions: [...routeVersions].sort((a, b) => a.committedAt.localeCompare(b.committedAt)),
+              lineChangeDrafts,
               loading: false,
               ready: true,
               error: '',
@@ -283,6 +293,23 @@ function createPondStore() {
     return result;
   }
 
+  /** 当前在用路线版本（取 isActive，兜底最新一条） */
+  function activeRouteVersion(): RouteVersion | null {
+    const list = state.routeVersions;
+    return list.find((version) => version.isActive) ?? list[list.length - 1] ?? null;
+  }
+
+  /** 路线版本号文案，未知版本回退为「旧版?」 */
+  function routeVersionCode(versionId: string): string {
+    const version = state.routeVersions.find((item) => item.id === versionId);
+    return version?.code ?? '旧版?';
+  }
+
+  /** 某池系是否存在未提交的换线草稿 */
+  function lineChangeDraftOf(seriesName: string): LineChangeDraft | undefined {
+    return state.lineChangeDrafts.find((draft) => draft.seriesName === seriesName);
+  }
+
   return {
     state,
     revision,
@@ -295,6 +322,9 @@ function createPondStore() {
     patchFilters,
     resetFilters,
     stageDistribution,
+    activeRouteVersion,
+    routeVersionCode,
+    lineChangeDraftOf,
     loadAll,
     setCurrentSeries,
     createPond,

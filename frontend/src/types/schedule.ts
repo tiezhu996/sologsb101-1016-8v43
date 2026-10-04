@@ -27,6 +27,20 @@ export interface Schedule {
   state: ScheduleState
   /** 手工拖拽后的排序序号，越小越先走水 */
   orderIndex: number
+  /** 该条计划当前使用的路线版本 */
+  routeVersionId: string
+  /** 途经池 id 链（含起点与终点）；待确认或无下游时可能只有起点 */
+  routePath: string[]
+  /** 路线终点池 id */
+  routeEndPondId: string
+  /** 已开始走水 / 已出卤后锁定，换线不再改其路线与次序 */
+  routeLocked: boolean
+  /** true = 路线经停用池或找不到连续下游，留在待确认区，需调度员人工确认 */
+  routePending: boolean
+  /** 待确认原因（经过停用池 / 找不到连续下游 / 串级成环等） */
+  routeIssue: string
+  /** 人工确认待确认路线后置 true（仍保留原因，供页面与导出标注） */
+  routeConfirmed: boolean
   createdAt: string
   updatedAt: string
   revision: number
